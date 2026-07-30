@@ -31,6 +31,18 @@ pub struct AppSettings {
     pub bridge: BridgeSettings,
     #[serde(default)]
     pub league: LeagueSettings,
+    #[serde(default)]
+    pub accessibility: AccessibilitySettings,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AccessibilitySettings {
+    #[serde(default)]
+    pub reduce_motion: bool,
+    #[serde(default)]
+    pub reduce_transparency: bool,
+    #[serde(default)]
+    pub disable_haptics: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -40,17 +52,29 @@ pub struct LeagueSettings {
     #[serde(default)]
     pub auto_accept: bool,
     #[serde(default)]
+    pub auto_accept_delay: u8,
+    #[serde(default = "default_notify_ready_check")]
+    pub notify_ready_check: bool,
+    #[serde(default)]
     pub auto_pick: bool,
     #[serde(default)]
     pub auto_ban: bool,
     #[serde(default)]
+    pub auto_ban_delay: u8,
+    #[serde(default)]
     pub auto_lock: bool,
+    #[serde(default)]
+    pub auto_lock_at_timeout: bool,
     #[serde(default)]
     pub auto_runes: bool,
     #[serde(default)]
     pub auto_honor: bool,
     #[serde(default)]
     pub auto_play_again: bool,
+    #[serde(default)]
+    pub auto_requeue: bool,
+    #[serde(default)]
+    pub auto_accept_swaps: bool,
     #[serde(default)]
     pub auto_reconnect: bool,
     #[serde(default)]
@@ -67,17 +91,27 @@ fn default_league_enabled() -> bool {
     true
 }
 
+fn default_notify_ready_check() -> bool {
+    true
+}
+
 impl Default for LeagueSettings {
     fn default() -> Self {
         Self {
             enabled: default_league_enabled(),
             auto_accept: false,
+            auto_accept_delay: 0,
+            notify_ready_check: default_notify_ready_check(),
             auto_pick: false,
             auto_ban: false,
+            auto_ban_delay: 0,
             auto_lock: false,
+            auto_lock_at_timeout: false,
             auto_runes: false,
             auto_honor: false,
             auto_play_again: false,
+            auto_requeue: false,
+            auto_accept_swaps: false,
             auto_reconnect: false,
             auto_trade: String::new(),
             auto_message: String::new(),
@@ -603,6 +637,7 @@ impl Default for AppSettings {
             rpc: RpcSettings::default(),
             bridge: BridgeSettings::default(),
             league: LeagueSettings::default(),
+            accessibility: AccessibilitySettings::default(),
         }
     }
 }
@@ -653,5 +688,48 @@ mod backcompat_tests {
         let round = serde_json::to_value(&parsed).expect("serializa");
         let back: AdvancedSettings = serde_json::from_value(round).expect("volta");
         assert!(back.insecure_tls);
+    }
+
+    // A #220 adicionou `accessibility` ao AppSettings sem teste de migracao.
+    // Um settings.json escrito antes da 0.8.0 nao tem esse campo; se ele perder
+    // o `serde(default)` num refactor, todo usuario existente perde a
+    // configuracao inteira, em silencio, no primeiro boot depois do update.
+    //
+    // Em vez de escrever um JSON antigo a mao (que envelhece e vira ficcao),
+    // este teste serializa o default atual e *remove* a chave nova — que e
+    // exatamente a forma de um arquivo gravado antes de o campo existir.
+    #[test]
+    fn settings_json_sem_accessibility_ainda_abre() {
+        let atual = serde_json::to_value(AppSettings::default()).expect("serializa");
+        let mut anterior = atual.clone();
+        let obj = anterior.as_object_mut().expect("objeto");
+        let removida = obj.remove("accessibility");
+        assert!(
+            removida.is_some(),
+            "o campo tem que existir hoje, senao o teste nao prova nada"
+        );
+
+        let parsed: AppSettings =
+            serde_json::from_value(anterior).expect("arquivo pre-0.8.0 tem que abrir");
+
+        assert!(!parsed.accessibility.reduce_motion);
+        assert!(!parsed.accessibility.reduce_transparency);
+        // E o que o usuario ja tinha nao pode sumir junto.
+        assert_eq!(
+            parsed.appearance.theme,
+            AppSettings::default().appearance.theme
+        );
+        assert_eq!(parsed.schema_version, AppSettings::default().schema_version);
+    }
+
+    #[test]
+    fn acessibilidade_ligada_sobrevive_ao_round_trip() {
+        let mut s = AppSettings::default();
+        s.accessibility.reduce_motion = true;
+        s.accessibility.reduce_transparency = true;
+        let round = serde_json::to_value(&s).expect("serializa");
+        let back: AppSettings = serde_json::from_value(round).expect("volta");
+        assert!(back.accessibility.reduce_motion);
+        assert!(back.accessibility.reduce_transparency);
     }
 }

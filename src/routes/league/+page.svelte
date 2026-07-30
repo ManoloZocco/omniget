@@ -20,6 +20,7 @@
   import AutomationTab from "$components/league/AutomationTab.svelte";
   import HistoryTab from "$components/league/HistoryTab.svelte";
   import type { Champion, GoalKey, LobbyQueue, RankedEntry, Role, ScoutPlayer } from "$components/league/shared";
+  import type { Platform } from "$components/league/registry";
 
   type LeagueStatus = { connected: boolean; port: number | null; region: string | null };
 
@@ -135,6 +136,16 @@
   let analysisLoading = $state(false);
   let liveMetrics = $state<any>(null);
   let cooldowns = $state<any>(null);
+  let liveEvents = $state<any>(null);
+
+  // The registry needs to know where it runs to explain platform limits.
+  let platform = $derived<Platform>(
+    navigator.userAgent.includes("Windows")
+      ? "windows"
+      : navigator.userAgent.includes("Mac")
+        ? "macos"
+        : "linux",
+  );
 
   const GOALS_KEY = "league-role-goals";
 
@@ -191,6 +202,14 @@
       liveMetrics = await invoke<any>("league_live_metrics");
     } catch {
       liveMetrics = null;
+    }
+  }
+
+  async function loadLiveEvents() {
+    try {
+      liveEvents = await invoke<any>("league_live_events");
+    } catch {
+      liveEvents = null;
     }
   }
 
@@ -276,9 +295,11 @@
     if (phase === "InProgress") {
       loadLiveMetrics();
       loadCooldowns();
+      loadLiveEvents();
     } else if (liveMetrics) {
       liveMetrics = null;
       cooldowns = null;
+      liveEvents = null;
     }
     if (phase === "Lobby" || phase === "Matchmaking") {
       try {
@@ -439,10 +460,10 @@
            timers, expanded games) survives switching, and the meta tab's
            auto-rune effect keeps working from any tab. -->
       <div class="tab-panel" class:active={tab === "overview"}>
-        <OverviewTab {summoner} {ranked} {phase} {champSelect} {liveGame} {lobby} {queues} {actionError} {championById} {championByAlias} onAction={action} />
+        <OverviewTab {summoner} {ranked} {phase} {champSelect} {liveGame} {lobby} {queues} {actionError} {champions} {championById} {championByAlias} onAction={action} />
       </div>
       <div class="tab-panel" class:active={tab === "analysis"}>
-        <AnalysisTab {analysis} {analysisLoading} onRefreshAnalysis={loadAnalysis} {phase} {scoutPlayers} {scoutReports} {scoutLoading} onRefreshScouting={loadScouting} {championById} {notes} onSaveNote={saveNote} {timesSeenBefore} />
+        <AnalysisTab {analysis} {analysisLoading} onRefreshAnalysis={loadAnalysis} {phase} {scoutPlayers} {scoutReports} {scoutLoading} onRefreshScouting={loadScouting} {championById} {notes} onSaveNote={saveNote} {timesSeenBefore} {platform} clientConnected={status.connected} />
       </div>
       <div class="tab-panel" class:active={tab === "meta"}>
         <MetaTab {champSelectChampionId} {myAssignedPosition} {championById} {champions} region={status.region} />
@@ -451,7 +472,8 @@
         <SearchTab {championById} />
       </div>
       <div class="tab-panel" class:active={tab === "live"}>
-        <LiveTab {liveMetrics} {cooldowns} {goalValue} />
+        <LiveTab {liveMetrics} {cooldowns} {liveEvents} {goalValue} {platform} clientConnected={status.connected} />
+        <LiveTab {liveMetrics} {cooldowns} {liveEvents} {goalValue} />
       </div>
       <div class="tab-panel" class:active={tab === "goals"}>
         <GoalsTab {goalValue} {setGoal} {resetGoals} />
@@ -820,6 +842,129 @@
     color: var(--gray);
     }
 
+  .league-page :global(.scout-notices) {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    margin-bottom: 10px;
+    padding: 8px 10px;
+    border: 1px solid var(--border);
+    border-radius: var(--border-radius);
+    background: var(--surface-hover);
+    }
+
+  .league-page :global(.scout-notice) {
+    margin: 0;
+    font-size: 12.5px;
+    color: var(--text-secondary);
+    }
+
+  .league-page :global(.reroll-actions) {
+    display: flex;
+    gap: 6px;
+    flex-wrap: wrap;
+    }
+
+  .league-page :global(.queue-filter) {
+    display: flex;
+    gap: 6px;
+    flex-wrap: wrap;
+    margin-bottom: 8px;
+    }
+
+  .league-page :global(.queue-chip) {
+    padding: 3px 10px;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    background: transparent;
+    color: var(--text-secondary);
+    font-size: 12px;
+    cursor: pointer;
+    }
+
+  .league-page :global(.queue-chip:hover) {
+    background: var(--surface-hover);
+    }
+
+  .league-page :global(.queue-chip.on) {
+    border-color: var(--accent);
+    color: var(--text);
+    }
+
+  .league-page :global(.history-summary) {
+    font-size: 12.5px;
+    color: var(--text-secondary);
+    margin: 0 0 10px;
+    }
+
+  .league-page :global(.objective-row) {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+    }
+
+  .league-page :global(.objective-chip) {
+    display: inline-flex;
+    align-items: baseline;
+    gap: 6px;
+    padding: 4px 8px;
+    border: 1px solid var(--border);
+    border-radius: var(--border-radius);
+    font-variant-numeric: tabular-nums;
+    font-size: 12.5px;
+    }
+
+  .league-page :global(.event-feed) {
+    list-style: none;
+    margin: 12px 0 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    }
+
+  .league-page :global(.event-item) {
+    display: flex;
+    gap: 8px;
+    font-size: 12.5px;
+    }
+
+  .league-page :global(.event-time) {
+    color: var(--gray);
+    font-variant-numeric: tabular-nums;
+    min-width: 42px;
+    }
+
+  .league-page :global(.event-text) {
+    display: flex;
+    gap: 4px;
+    flex-wrap: wrap;
+    }
+
+  .league-page :global(.delay-block) {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin-top: 10px;
+    }
+
+  .league-page :global(.slider-row) {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    }
+
+  .league-page :global(.slider-row input[type="range"]) {
+    flex: 1;
+    accent-color: var(--accent);
+    }
+
+  .league-page :global(.slider-edge) {
+    font-size: 11.5px;
+    color: var(--gray);
+    min-width: 26px;
+    }
+
   .league-page :global(.list-hint) {
     font-size: 11.5px;
     }
@@ -1006,6 +1151,11 @@
     gap: 6px;
     flex-wrap: wrap;
     margin-top: 10px;
+    }
+
+  .league-page :global(.premade-source) {
+    font-size: 0.75rem;
+    color: var(--text-muted);
     }
 
   .league-page :global(.gold-summary) {
@@ -1771,6 +1921,131 @@
     background: var(--danger);
     color: var(--on-status, var(--on-accent));
     border-color: transparent;
+    }
+
+  .league-page :global(.button.subtle) {
+    color: var(--text-secondary);
+    background: transparent;
+    }
+
+  .league-page :global(.button.subtle:hover) {
+    color: var(--text);
+    background: var(--surface-hover);
+    }
+
+  .league-page :global(.feature-badge) {
+    font-size: 10px;
+    font-weight: 400;
+    color: var(--text-muted);
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    padding: 1px 6px;
+    margin-left: 6px;
+    vertical-align: middle;
+    }
+
+  .league-page :global(.profile-tools) {
+    margin-bottom: 10px;
+    }
+
+  .league-page :global(.profile-tools summary) {
+    cursor: pointer;
+    font-size: 12.5px;
+    color: var(--text-secondary);
+    padding: 4px 0;
+    }
+
+  .league-page :global(.profile-tool-row) {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+    margin: 8px 0;
+    }
+
+  .league-page :global(.tiny-input) {
+    max-width: 96px;
+    }
+
+  .league-page :global(.skin-options) {
+    display: flex;
+    gap: 6px;
+    flex-wrap: wrap;
+    }
+
+  .league-page :global(.profile-saved) {
+    font-size: 12px;
+    color: var(--success);
+    margin: 4px 0;
+    }
+
+  .league-page :global(.skill-order) {
+    display: flex;
+    gap: 3px;
+    flex-wrap: wrap;
+    margin: 6px 0 10px;
+    }
+
+  .league-page :global(.skill-step) {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 18px;
+    height: 18px;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    font-size: 10.5px;
+    color: var(--text-secondary);
+    }
+
+  .league-page :global(.skill-step.ult) {
+    border-color: var(--accent);
+    color: var(--text);
+    }
+
+  .league-page :global(.build-phase) {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    margin-bottom: 8px;
+    }
+
+  .league-page :global(.scout-score) {
+    font-size: 11.5px;
+    color: var(--text-secondary);
+    font-variant-numeric: tabular-nums;
+    }
+
+  .league-page :global(.objective-line) {
+    display: flex;
+    gap: 12px;
+    flex-wrap: wrap;
+    font-size: 11.5px;
+    color: var(--text-secondary);
+    margin: 4px 0;
+    }
+
+  .league-page :global(.ban-line) {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    flex-wrap: wrap;
+    font-size: 11.5px;
+    margin-bottom: 6px;
+    }
+
+  .league-page :global(.repair-row) {
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 8px;
+    flex-wrap: wrap;
+    margin-bottom: 10px;
+    }
+
+  .league-page :global(.repair-note) {
+    font-size: 12px;
+    color: var(--text-secondary);
     }
 
   .league-page :global(.button.subtle-danger) {

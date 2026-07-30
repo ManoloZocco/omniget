@@ -321,13 +321,23 @@ pub fn run() {
             {
                 // `mut` so e usado no ramo Windows abaixo; sem o cfg_attr isto
                 // vira warning novo em macOS e Linux e reprova o portao de clippy.
-                #[cfg_attr(not(windows), allow(unused_mut))]
+                #[cfg_attr(not(any(windows, target_os = "linux")), allow(unused_mut))]
                 let mut builder = tauri::WebviewWindowBuilder::from_config(
                     app.handle(),
                     &app.config().app.windows[0],
                 )?;
 
-                #[cfg(windows)]
+                // Nao e so Windows. No Linux o wry usa este caminho para
+                // `base_data_directory`, `base_cache_directory` e os cookies do
+                // WebKitGTK; sem ele o modo portatil deixa
+                // `XDG_DATA_HOME/wtf.tonho.omniget` no perfil do usuario — a
+                // mesma #209, fora do Windows. Foi o smoke test do B55 que
+                // pegou isso, na primeira vez que rodou.
+                //
+                // macOS fica de fora porque o wry nao le `data_directory` no
+                // WKWebView: incluir daria a impressao de cobrir um caso que
+                // nao esta coberto.
+                #[cfg(any(windows, target_os = "linux"))]
                 if let Some(webview_dir) = core::portable::portable_webview_dir_from_env() {
                     if let Err(e) = std::fs::create_dir_all(&webview_dir) {
                         tracing::warn!(
@@ -344,7 +354,42 @@ pub fn run() {
                     }
                 }
 
+                // macOS nao tem para onde apontar: o wry nao le `data_directory`
+                // no WKWebView (nenhuma referencia em `src/wkwebview/`), ao
+                // contrario do webkitgtk, que a usa para base_data_directory,
+                // base_cache_directory e cookies.
+                //
+                // Entao o modo portatil nao cumpre o que promete aqui, e dizer
+                // isso e melhor do que deixar o usuario achar que o pendrive nao
+                // deixou rastro. Issue #227.
+                #[cfg(target_os = "macos")]
+                if core::portable::portable_webview_dir_from_env().is_some() {
+                    tracing::warn!(
+                        "[portable] no macOS o WebView guarda dados em ~/Library mesmo em modo \
+                         portatil — o wry nao permite redirecionar. Ver github.com/tonhowtf/omniget/issues/227"
+                    );
+                }
+
                 builder.build()?;
+
+                // A unica prova de que a janela subiu. O CI compila em todas as
+                // plataformas mas nunca abriu o app: foi assim que a #209 passou
+                // batido. O smoke test do CI casa exatamente esta linha.
+                tracing::info!("[startup] main window created");
+            }
+
+            // Modo smoke: sobe, prova que a janela existe, e sai sozinho com 0.
+            // So existe para o CI conseguir responder "abre?", que e a pergunta
+            // que compilar nunca responde.
+            if let Ok(raw) = std::env::var("OMNIGET_SMOKE_EXIT_MS") {
+                if let Ok(ms) = raw.trim().parse::<u64>() {
+                    let handle = app.handle().clone();
+                    std::thread::spawn(move || {
+                        std::thread::sleep(std::time::Duration::from_millis(ms));
+                        tracing::info!("[startup] smoke mode: exiting cleanly");
+                        handle.exit(0);
+                    });
+                }
             }
 
             commands::host_queue::register_event_listeners(app.handle());
@@ -523,6 +568,11 @@ pub fn run() {
             {
                 let app_handle = app.handle().clone();
                 omniget_core::core::log_hook::set_log_sink(std::sync::Arc::new(move |id, line| {
+                    // B33: caixa-preta. Toda linha de log de download passa por
+                    // aqui, e o `record` redige antes de guardar — e o unico
+                    // ponto onde da para capturar o historico sem instrumentar
+                    // cada chamada uma por uma.
+                    core::flight_recorder::record(line);
                     let should_emit = core::download_log::push_line(id, line);
                     if should_emit {
                         let _ = tauri::Emitter::emit(
@@ -759,6 +809,13 @@ pub fn run() {
             commands::auth_webview::open_auth_webview,
             commands::league::league_status,
             commands::league::league_get,
+            commands::league::league_install_dir,
+            commands::league::league_set_positions,
+            commands::league::league_end_of_game_stats,
+            commands::league::league_set_icon,
+            commands::league::league_set_profile_background,
+            commands::league::league_set_status,
+            commands::league::league_owned_skins,
             commands::league::league_summoner,
             commands::league::league_ranked,
             commands::league::league_gameflow,
@@ -774,11 +831,14 @@ pub fn run() {
             commands::league::league_play_again,
             commands::league::league_champ_select_session,
             commands::league::league_bench_swap,
+            commands::league::league_restart_ux,
             commands::league::league_reroll,
+            commands::league::league_reroll_keeping_champion,
             commands::league::league_live_game,
             commands::league::league_game_players,
             commands::league::league_player_report,
             commands::league::league_match_analysis,
+            commands::league::league_live_events,
             commands::league::league_live_metrics,
             commands::league::league_search_player,
             commands::league::league_duos,
@@ -786,6 +846,7 @@ pub fn run() {
             commands::league::league_apply_runes,
             commands::league::league_send_chat,
             commands::league::league_rune_recommendations,
+            commands::league::league_champion_meta,
             commands::league::league_champion_tiers,
             commands::league::league_champion_build,
             commands::league::league_ability_cooldowns,
@@ -820,6 +881,7 @@ pub fn run() {
             commands::clip::clip_video,
             commands::reencode::reencode_video,
             commands::diagnostics::get_hwaccel_info,
+            commands::diagnostics::diagnose_download_error,
             commands::downloads::detect_platform,
             commands::downloads::check_cookie_error,
             commands::downloads::validate_output_path,
@@ -903,6 +965,24 @@ pub fn run() {
             commands::dependencies::check_dependencies,
             commands::dependencies::check_ytdlp_available,
             commands::dependencies::install_dependency,
+            commands::dependencies::dependency_archived_versions,
+            commands::diagnostics::flight_recorder_dump,
+            commands::diagnostics::flight_recorder_clear,
+            commands::diagnostics::preflight_batch,
+            commands::dependencies::rollback_dependency,
+            commands::dependencies::clear_dependency_path,
+            commands::dependencies::dependency_custom_path,
+            commands::rules::list_rules,
+            commands::rules::save_rules,
+            commands::rules::preview_rule_match,
+            commands::media_history::check_media_changed,
+            commands::media_history::record_media_snapshot,
+            commands::dedupe::deduplicate_files,
+            commands::dedupe::content_store_stats,
+            commands::smart_speed::compute_silence_map,
+            commands::smart_speed::silence_skip_target,
+            commands::smart_speed::forget_silence_map,
+            commands::torrent_playback::torrent_playback_readiness,
             commands::dependencies::dependency_variants,
             commands::dependencies::dependency_install_dir,
             commands::dependencies::set_dependency_path,

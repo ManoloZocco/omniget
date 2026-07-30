@@ -4,7 +4,8 @@ use futures::{SinkExt, StreamExt};
 use once_cell::sync::OnceCell;
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicBool, Ordering};
-use tauri::Emitter;
+use tauri::{Emitter, Manager};
+use tauri_plugin_notification::NotificationExt;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::Connector;
@@ -13,11 +14,67 @@ static APP: OnceCell<tauri::AppHandle> = OnceCell::new();
 static STARTED: AtomicBool = AtomicBool::new(false);
 static WS_CONNECTED: AtomicBool = AtomicBool::new(false);
 static MESSAGE_SENT: AtomicBool = AtomicBool::new(false);
+static ACCEPT_PENDING: AtomicBool = AtomicBool::new(false);
+static NOTIFIED_READY_CHECK: AtomicBool = AtomicBool::new(false);
 static TRADES_HANDLED: once_cell::sync::Lazy<tokio::sync::Mutex<std::collections::HashSet<i64>>> =
     once_cell::sync::Lazy::new(|| tokio::sync::Mutex::new(std::collections::HashSet::new()));
+#[allow(clippy::type_complexity)]
+static SWAPS_HANDLED: once_cell::sync::Lazy<
+    tokio::sync::Mutex<std::collections::HashSet<(&'static str, i64)>>,
+> = once_cell::sync::Lazy::new(|| tokio::sync::Mutex::new(std::collections::HashSet::new()));
+
+/// A queue pops after roughly twelve seconds without an answer, so a longer
+/// delay would simply waste the queue slot.
+const MAX_ACCEPT_DELAY: u8 = 11;
 
 pub fn is_connected() -> bool {
     WS_CONNECTED.load(Ordering::Relaxed)
+}
+
+fn pending_ready_check(state: &str) -> bool {
+    state == "InProgress"
+}
+
+fn accept_delay_seconds(setting: u8) -> u8 {
+    setting.min(MAX_ACCEPT_DELAY)
+}
+
+/// A ready check is only worth accepting while it is still open and the user has
+/// not answered it: an explicit decline must never be overridden.
+fn should_accept_ready_check(state: &str, player_response: &str) -> bool {
+    pending_ready_check(state) && player_response == "None"
+}
+
+/// A queue popping while the user looks at another window is exactly the moment
+/// a notification earns its keep; firing one over a focused app would be noise.
+fn notify_ready_check() {
+    if !league_settings().notify_ready_check {
+        return;
+    }
+    let Some(app) = APP.get() else { return };
+    let focused = app
+        .get_webview_window("main")
+        .and_then(|w| w.is_focused().ok())
+        .unwrap_or(false);
+    if focused {
+        return;
+    }
+    if let Err(e) = app
+        .notification()
+        .builder()
+        .title("OmniGet")
+        .body("League of Legends: match found")
+        .show()
+    {
+        tracing::debug!("[league] ready check notification failed: {}", e);
+    }
+}
+
+async fn accept_ready_check(client: &LcuClient) {
+    match lcu_post_raw(client, "/lol-matchmaking/v1/ready-check/accept").await {
+        Ok(_) => tracing::info!("[league] ready check accepted"),
+        Err(e) => tracing::warn!("[league] auto-accept failed: {}", e),
+    }
 }
 
 fn emit(event: &str, payload: Value) {
@@ -165,20 +222,58 @@ async fn handle_event(client: &LcuClient, value: &Value) {
                 .and_then(Value::as_str)
                 .unwrap_or("");
             emit("league-ready-check", data.clone());
-            if state == "InProgress"
-                && response == "None"
+            if !pending_ready_check(state) {
+                ACCEPT_PENDING.store(false, Ordering::SeqCst);
+                NOTIFIED_READY_CHECK.store(false, Ordering::SeqCst);
+            } else if should_accept_ready_check(state, response)
+                && !NOTIFIED_READY_CHECK.swap(true, Ordering::SeqCst)
+            {
+                notify_ready_check();
+            }
+            if should_accept_ready_check(state, response)
                 && super::AUTO_ACCEPT.load(Ordering::Relaxed)
             {
-                match lcu_post_raw(client, "/lol-matchmaking/v1/ready-check/accept").await {
-                    Ok(_) => tracing::info!("[league] ready check accepted"),
-                    Err(e) => tracing::warn!("[league] auto-accept failed: {}", e),
+                let delay = accept_delay_seconds(league_settings().auto_accept_delay);
+                if delay == 0 {
+                    accept_ready_check(client).await;
+                } else if !ACCEPT_PENDING.swap(true, Ordering::SeqCst) {
+                    // The client re-emits the ready check every tick, so the
+                    // countdown must be started only once.
+                    let client = client.clone();
+                    tauri::async_runtime::spawn(async move {
+                        tokio::time::sleep(std::time::Duration::from_secs(delay as u64)).await;
+                        ACCEPT_PENDING.store(false, Ordering::SeqCst);
+                        // The user may have declined during the countdown, so
+                        // the current state decides, not the event that started it.
+                        match lcu_get_raw(&client, "/lol-matchmaking/v1/ready-check").await {
+                            Ok(current) => {
+                                let state =
+                                    current.get("state").and_then(Value::as_str).unwrap_or("");
+                                let response = current
+                                    .get("playerResponse")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("");
+                                if should_accept_ready_check(state, response) {
+                                    accept_ready_check(&client).await;
+                                } else {
+                                    tracing::debug!(
+                                        "[league] auto-accept skipped: no longer pending"
+                                    );
+                                }
+                            }
+                            Err(e) => tracing::debug!("[league] ready check re-read failed: {}", e),
+                        }
+                    });
                 }
             }
         }
         "/lol-champ-select/v1/session" => {
             if event_type == "Delete" {
                 super::CS_HANDLED.lock().await.clear();
+                super::CS_FIRST_SEEN.lock().await.clear();
+                super::CS_DECLARED.lock().await.clear();
                 TRADES_HANDLED.lock().await.clear();
+                SWAPS_HANDLED.lock().await.clear();
                 MESSAGE_SENT.store(false, Ordering::SeqCst);
                 emit("league-champ-select", Value::Null);
                 return;
@@ -191,6 +286,7 @@ async fn handle_event(client: &LcuClient, value: &Value) {
                 }
             }
             handle_trades(client, &settings, &data).await;
+            handle_swaps(client, &settings, &data).await;
             send_auto_message(client, &settings);
         }
         "/lol-lobby/v2/lobby" => {
@@ -226,7 +322,12 @@ async fn on_phase(client: &LcuClient, phase: &str) {
         "EndOfGame" => {
             if settings.auto_play_again {
                 match lcu_post_raw(client, "/lol-lobby/v2/play-again").await {
-                    Ok(_) => tracing::info!("[league] queued play again"),
+                    Ok(_) => {
+                        tracing::info!("[league] queued play again");
+                        if settings.auto_requeue {
+                            requeue_if_leader(client).await;
+                        }
+                    }
                     Err(e) => tracing::debug!("[league] auto play-again failed: {}", e),
                 }
             }
@@ -241,7 +342,10 @@ async fn on_phase(client: &LcuClient, phase: &str) {
         _ => {
             if phase != "ChampSelect" {
                 super::CS_HANDLED.lock().await.clear();
+                super::CS_FIRST_SEEN.lock().await.clear();
+                super::CS_DECLARED.lock().await.clear();
                 TRADES_HANDLED.lock().await.clear();
+                SWAPS_HANDLED.lock().await.clear();
                 MESSAGE_SENT.store(false, Ordering::SeqCst);
             }
         }
@@ -289,8 +393,76 @@ async fn handle_trades(
             Ok(_) => {
                 TRADES_HANDLED.lock().await.insert(id);
                 tracing::info!("[league] trade request {}: {}ed", id, strategy);
+                // Without clearing it the client keeps the request pending in the
+                // UI even though it was already answered.
+                let cleared = lcu_post_raw(
+                    client,
+                    &format!("/lol-champ-select/v1/ongoing-trade/{}/clear", id),
+                )
+                .await;
+                if let Err(e) = cleared {
+                    tracing::debug!("[league] clearing trade {} failed: {}", id, e);
+                }
             }
             Err(e) => tracing::debug!("[league] trade {} failed: {}", strategy, e),
+        }
+    }
+}
+
+/// Starting the search only works for the lobby leader, and the lobby takes a
+/// moment to exist after play-again, hence the short retry.
+async fn requeue_if_leader(client: &LcuClient) {
+    for attempt in 0..3 {
+        tokio::time::sleep(std::time::Duration::from_millis(700 * (attempt + 1))).await;
+        let Ok(lobby) = lcu_get_raw(client, "/lol-lobby/v2/lobby").await else {
+            continue;
+        };
+        if !super::lobby::is_leader(&lobby) {
+            tracing::debug!("[league] not the lobby leader, skipping requeue");
+            return;
+        }
+        match lcu_post_raw(client, "/lol-lobby/v2/lobby/matchmaking/search").await {
+            Ok(_) => {
+                tracing::info!("[league] requeued after play again");
+                return;
+            }
+            Err(e) => tracing::debug!("[league] requeue attempt failed: {}", e),
+        }
+    }
+}
+
+/// Accepts position and pick-order swap requests, then clears the pending state
+/// so the client stops showing the prompt.
+async fn handle_swaps(
+    client: &LcuClient,
+    settings: &omniget_core::models::settings::LeagueSettings,
+    session: &Value,
+) {
+    if !settings.auto_accept_swaps {
+        return;
+    }
+    for (kind, id) in super::lobby::pending_swaps(session) {
+        {
+            let handled = SWAPS_HANDLED.lock().await;
+            if handled.contains(&(kind, id)) {
+                continue;
+            }
+        }
+        let path = format!("/lol-champ-select/v1/session/{}/{}/accept", kind, id);
+        match lcu_post_raw(client, &path).await {
+            Ok(_) => {
+                SWAPS_HANDLED.lock().await.insert((kind, id));
+                tracing::info!("[league] accepted {} request {}", kind, id);
+                let cleared = lcu_post_raw(
+                    client,
+                    &format!("/lol-champ-select/v1/ongoing-swap/{}/clear", id),
+                )
+                .await;
+                if let Err(e) = cleared {
+                    tracing::debug!("[league] clearing swap {} failed: {}", id, e);
+                }
+            }
+            Err(e) => tracing::debug!("[league] accepting {} failed: {}", kind, e),
         }
     }
 }
@@ -391,5 +563,36 @@ async fn honor_from_ballot(client: &LcuClient, ballot: &Value) {
     match legacy {
         Ok(_) => tracing::info!("[league] honored a teammate"),
         Err(e) => tracing::debug!("[league] auto-honor failed: {}", e),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_open_and_unanswered_ready_check_is_accepted() {
+        assert!(should_accept_ready_check("InProgress", "None"));
+    }
+
+    #[test]
+    fn a_declined_ready_check_is_never_overridden() {
+        assert!(!should_accept_ready_check("InProgress", "Declined"));
+        assert!(!should_accept_ready_check("InProgress", "Accepted"));
+    }
+
+    #[test]
+    fn a_closed_ready_check_is_left_alone() {
+        for state in ["Invalid", "EveryoneReady", "StrangerNotReady", ""] {
+            assert!(!should_accept_ready_check(state, "None"), "state {}", state);
+            assert!(!pending_ready_check(state), "state {}", state);
+        }
+    }
+
+    #[test]
+    fn the_delay_is_capped_below_the_queue_timeout() {
+        assert_eq!(accept_delay_seconds(255), MAX_ACCEPT_DELAY);
+        assert_eq!(accept_delay_seconds(3), 3);
+        assert_eq!(accept_delay_seconds(0), 0);
     }
 }

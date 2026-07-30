@@ -65,6 +65,8 @@
     if (name) {
       void loadVariants();
       void loadInstallDir();
+      void loadArchived();
+      void loadCustomPath();
     }
   });
 
@@ -92,6 +94,7 @@
         sourcePath: selected,
       });
       showToast("success", `${name}: ${result}`);
+      void loadCustomPath();
       void onAfterCustomFile?.();
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
@@ -131,7 +134,60 @@
     }
   });
 
-  let supportsCustomFile = $derived(name === "PDFium");
+  // #222: as tres, e nao so o PDFium.
+  let supportsCustomFile = $derived(["yt-dlp", "FFmpeg", "PDFium"].includes(name));
+
+  let customPath = $state<string | null>(null);
+
+  async function loadCustomPath() {
+    try {
+      customPath = await invoke<string | null>("dependency_custom_path", { name });
+    } catch {
+      customPath = null;
+    }
+  }
+
+  async function handleClearCustom() {
+    menuOpen = false;
+    try {
+      await invoke("clear_dependency_path", { name });
+      showToast("success", $t("settings.dependencies.custom_cleared") as string);
+      void loadCustomPath();
+      void onAfterCustomFile?.();
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      showToast("error", $t("settings.dependencies.set_file_failed", { msg }) as string);
+    }
+  }
+
+  type ArchivedVersion = { stamp_ms: string; path: string };
+  let archived = $state<ArchivedVersion[]>([]);
+  let rollingBack = $state<string | null>(null);
+
+  async function loadArchived() {
+    try {
+      archived = await invoke<ArchivedVersion[]>("dependency_archived_versions", { name });
+    } catch {
+      archived = [];
+    }
+  }
+
+  async function handleRollback(stampMs: string) {
+    if (rollingBack) return;
+    rollingBack = stampMs;
+    try {
+      const version = await invoke<string>("rollback_dependency", { name, stampMs });
+      showToast("success", $t("settings.dependencies.rollback_done", { version }) as string);
+      menuOpen = false;
+      void onAfterCustomFile?.();
+      void loadArchived();
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      showToast("error", $t("settings.dependencies.rollback_failed", { msg }) as string);
+    } finally {
+      rollingBack = null;
+    }
+  }
 </script>
 
 <tr class="deps-table-row">
@@ -223,6 +279,31 @@
             >
               {$t("settings.dependencies.show_folder")}
             </button>
+            {#if customPath}
+              <div class="menu-label" title={customPath}>
+                {$t("settings.dependencies.custom_in_use")}
+              </div>
+              <button type="button" class="menu-item" onclick={handleClearCustom} role="menuitem">
+                {$t("settings.dependencies.use_managed_again")}
+              </button>
+            {/if}
+            {#if archived.length > 0}
+              <div class="menu-sep"></div>
+              <div class="menu-label">{$t("settings.dependencies.previous_versions")}</div>
+              {#each archived as v (v.stamp_ms)}
+                <button
+                  type="button"
+                  class="menu-item"
+                  onclick={() => handleRollback(v.stamp_ms)}
+                  disabled={rollingBack !== null}
+                  role="menuitem"
+                >
+                  {$t("settings.dependencies.rollback_to", {
+                    when: new Date(Number(v.stamp_ms)).toLocaleString(),
+                  })}
+                </button>
+              {/each}
+            {/if}
             {#if path}
               <div class="menu-path" title={path}>
                 <code>{path}</code>
@@ -338,6 +419,16 @@
   }
   .menu-wrap {
     position: relative;
+  }
+  .menu-sep {
+    height: 1px;
+    margin: 4px 0;
+    background: var(--border);
+  }
+  .menu-label {
+    padding: 4px 10px;
+    font-size: var(--text-xs, 0.75rem);
+    color: var(--text-muted, var(--text-secondary));
   }
   .menu-btn {
     padding: 5px 10px;

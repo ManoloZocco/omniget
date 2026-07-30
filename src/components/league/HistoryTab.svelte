@@ -3,6 +3,8 @@
   import { t, locale } from "$lib/i18n";
   import timeAgo from "$lib/time-ago";
   import { CDRAGON, type Champion } from "./shared";
+  import { filterByQueue, queuesInGames, summarise } from "$lib/league-history";
+  import { findTeam, teamBans, teamObjectives } from "$lib/league-match-detail";
 
   let {
     games,
@@ -30,6 +32,19 @@
   function queueName(id: number, mode: string): string {
     return QUEUE_NAMES[id] ?? mode ?? "";
   }
+
+  let queueFilter = $state<number | null>(null);
+  let availableQueues = $derived(queuesInGames(games));
+  let visibleGames = $derived(filterByQueue(games, queueFilter));
+  let summary = $derived(summarise(visibleGames));
+
+  $effect(() => {
+    // A filter kept after a refresh that no longer has the queue would show an
+    // empty list with no explanation.
+    if (queueFilter !== null && !availableQueues.includes(queueFilter)) {
+      queueFilter = null;
+    }
+  });
 
   function playerStats(game: any): { championId: number; kills: number; deaths: number; assists: number; win: boolean } {
     const p = game?.participants?.[0];
@@ -100,8 +115,33 @@
   {#if games.length === 0}
     <p class="empty-hint">{$t("league.history_empty")}</p>
   {:else}
+    {#if availableQueues.length > 1}
+      <div class="queue-filter" role="group" aria-label={$t("league.filter_queue") as string}>
+        <button class="queue-chip" class:on={queueFilter === null} onclick={() => (queueFilter = null)} aria-pressed={queueFilter === null}>
+          {$t("league.filter_all")}
+        </button>
+        {#each availableQueues as id (id)}
+          <button class="queue-chip" class:on={queueFilter === id} onclick={() => (queueFilter = id)} aria-pressed={queueFilter === id}>
+            {queueName(id, "")}
+          </button>
+        {/each}
+      </div>
+    {/if}
+    <p class="history-summary">
+      {summary.counted}
+      {$t("league.summary_games")}
+      {#if summary.winrate !== null}
+        · <strong>{summary.wins}{$t("league.summary_win_short")} {summary.losses}{$t("league.summary_loss_short")}</strong> · {summary.winrate}%
+      {/if}
+      {#if summary.kda !== null}
+        · KDA {summary.kda.toFixed(2)}
+      {/if}
+      {#if summary.remakes > 0}
+        · <span class="dim">{summary.remakes} {$t("league.summary_remakes")}</span>
+      {/if}
+    </p>
     <div class="game-list">
-      {#each games as game (game.gameId)}
+      {#each visibleGames as game (game.gameId)}
         {@const p = playerStats(game)}
         <button
           class="game-row"
@@ -124,10 +164,35 @@
           {:else if gameDetails[game.gameId]}
             <div class="scoreboard">
               {#each scoreboardTeams(gameDetails[game.gameId]) as team (team.teamId)}
+                {@const objectives = teamObjectives(findTeam(gameDetails[game.gameId]?.teams, team.teamId))}
+                {@const bans = teamBans(findTeam(gameDetails[game.gameId]?.teams, team.teamId))}
                 <div class="scoreboard-team">
                   <span class="scoreboard-result" class:win={team.players[0]?.win} class:loss={!team.players[0]?.win}>
                     {team.players[0]?.win ? $t("league.victory") : $t("league.defeat")}
                   </span>
+                  {#if objectives}
+                    <div class="objective-line">
+                      <span>{$t("league.obj_towers")} <strong>{objectives.towers}</strong></span>
+                      <span>{$t("league.obj_inhibitors")} <strong>{objectives.inhibitors}</strong></span>
+                      <span>{$t("league.objective_baron")} <strong>{objectives.barons}</strong></span>
+                      <span>{$t("league.objective_dragon")} <strong>{objectives.dragons}</strong></span>
+                      <span>{$t("league.obj_heralds")} <strong>{objectives.heralds}</strong></span>
+                    </div>
+                  {/if}
+                  {#if bans.length > 0}
+                    <div class="ban-line">
+                      <span class="dim">{$t("league.obj_bans")}</span>
+                      {#each bans as banId, i (`${banId}-${i}`)}
+                        <img
+                          class="champ-icon tiny"
+                          src={`${CDRAGON}/champion-icons/${banId}.png`}
+                          alt=""
+                          title={championById.get(banId)?.name ?? ""}
+                          loading="lazy"
+                        />
+                      {/each}
+                    </div>
+                  {/if}
                   {#each team.players as sp (sp.participantId)}
                     <div class="scoreboard-row">
                       <img class="champ-icon tiny" src={`${CDRAGON}/champion-icons/${sp.championId}.png`} alt="" loading="lazy" />

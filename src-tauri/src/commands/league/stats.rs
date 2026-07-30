@@ -483,6 +483,76 @@ pub fn impact_score(input: &ImpactInput) -> f64 {
         .clamp(0.0, 10.0)
 }
 
+/// Queues whose result carries signal for a player score. Customs, bots and
+/// rotating modes are left out.
+pub const SCORED_QUEUES: [i64; 5] = [400, 420, 430, 440, 450];
+
+/// Below this many usable games the average describes luck, not the player, so no
+/// score is reported at all — an honest blank beats a confident wrong number.
+pub const SCORE_MIN_GAMES: usize = 5;
+
+/// Games shorter than this were remakes.
+pub const SCORE_MIN_DURATION: i64 = 180;
+
+pub struct ScoredGame {
+    pub queue_id: i64,
+    pub duration: i64,
+    pub kills: i64,
+    pub deaths: i64,
+    pub assists: i64,
+    pub win: bool,
+    pub support: bool,
+}
+
+pub fn score_counts(game: &ScoredGame) -> bool {
+    SCORED_QUEUES.contains(&game.queue_id) && game.duration >= SCORE_MIN_DURATION
+}
+
+/// One game's contribution: a KDA-like ratio (assists worth a little more for
+/// supports, whose impact rarely shows up as kills), minus a penalty for games
+/// that ran away, plus the result.
+pub fn game_score(game: &ScoredGame) -> f64 {
+    let assist_weight = if game.support { 1.2 } else { 1.0 };
+    let ratio =
+        (game.kills as f64 + game.assists as f64 * assist_weight) / (game.deaths.max(1) as f64);
+    let penalty = if game.deaths > 20 && game.kills <= 10 {
+        1.0
+    } else if game.deaths > 15 && game.kills <= 10 {
+        0.5
+    } else {
+        0.0
+    };
+    ratio - penalty + if game.win { 1.0 } else { -1.0 }
+}
+
+/// Average score over the usable games, or `None` when the sample is too small.
+pub fn player_score(games: &[ScoredGame]) -> (Option<f64>, usize) {
+    let usable: Vec<&ScoredGame> = games.iter().filter(|g| score_counts(g)).collect();
+    if usable.len() < SCORE_MIN_GAMES {
+        return (None, usable.len());
+    }
+    let total: f64 = usable.iter().map(|g| game_score(g)).sum();
+    (Some(total / usable.len() as f64), usable.len())
+}
+
+/// Groups players that share a party id, which the gameflow session reports
+/// directly. Solo players carry a unique id, so single-player groups are
+/// dropped just like in the history-based detection.
+pub fn party_groups(party_ids: &[Option<String>]) -> Vec<Vec<usize>> {
+    let mut buckets: std::collections::HashMap<&str, Vec<usize>> = std::collections::HashMap::new();
+    for (index, id) in party_ids.iter().enumerate() {
+        if let Some(id) = id.as_deref().filter(|s| !s.is_empty()) {
+            buckets.entry(id).or_default().push(index);
+        }
+    }
+    let mut groups: Vec<Vec<usize>> = buckets.into_values().filter(|g| g.len() > 1).collect();
+    for group in groups.iter_mut() {
+        group.sort_unstable();
+    }
+    groups.sort_by(|a, b| a[0].cmp(&b[0]));
+    groups
+}
+
 /// Disjoint-set forest used to merge overlapping premade pairs.
 struct DisjointSet {
     parent: Vec<usize>,
@@ -847,6 +917,35 @@ mod tests {
         assert_eq!(groups, vec![vec![0, 1], vec![2, 3]]);
     }
 
+    fn ids(values: &[&str]) -> Vec<Option<String>> {
+        values
+            .iter()
+            .map(|v| {
+                if v.is_empty() {
+                    None
+                } else {
+                    Some(v.to_string())
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn party_ids_group_a_duo_and_a_trio_and_drop_solos() {
+        // Solo queuers each carry their own party id.
+        let groups = party_groups(&ids(&["p1", "p2", "p1", "p3", "p2", "p2"]));
+        assert_eq!(groups, vec![vec![0, 2], vec![1, 4, 5]]);
+    }
+
+    #[test]
+    fn missing_party_ids_are_never_grouped_together() {
+        // Champ select carries no party id: absent must not read as "same party".
+        assert!(party_groups(&ids(&["", "", "", "", ""])).is_empty());
+        assert!(party_groups(&[]).is_empty());
+        let groups = party_groups(&ids(&["", "p9", "", "p9"]));
+        assert_eq!(groups, vec![vec![1, 3]]);
+    }
+
     #[test]
     fn role_targets_reflect_role_reality() {
         let sup = default_targets("UTILITY");
@@ -857,5 +956,84 @@ mod tests {
         // Unknown roles fall back to a neutral profile rather than panicking.
         let unknown = default_targets("");
         assert!(unknown.cs_per_min > 0.0);
+    }
+
+    fn scored(kills: i64, deaths: i64, assists: i64, win: bool) -> ScoredGame {
+        ScoredGame {
+            queue_id: 420,
+            duration: 1800,
+            kills,
+            deaths,
+            assists,
+            win,
+            support: false,
+        }
+    }
+
+    #[test]
+    fn only_ranked_and_normal_games_of_real_length_count() {
+        assert!(score_counts(&scored(5, 2, 5, true)));
+        let remake = ScoredGame {
+            duration: 120,
+            ..scored(0, 0, 0, false)
+        };
+        assert!(!score_counts(&remake));
+        let arena = ScoredGame {
+            queue_id: 1700,
+            ..scored(5, 2, 5, true)
+        };
+        assert!(!score_counts(&arena));
+    }
+
+    #[test]
+    fn a_clean_win_scores_above_a_fed_loss() {
+        let clean = game_score(&scored(8, 4, 8, true));
+        let fed = game_score(&scored(2, 22, 1, false));
+        assert!(clean > fed);
+        assert!(fed < -1.8, "got {}", fed);
+        // (8 + 8) / 4 = 4, no penalty, +1 for the win.
+        assert!(close(clean, 5.0, 1e-9), "got {}", clean);
+    }
+
+    #[test]
+    fn support_assists_weigh_a_little_more() {
+        let carry = game_score(&scored(2, 4, 12, true));
+        let support = game_score(&ScoredGame {
+            support: true,
+            ..scored(2, 4, 12, true)
+        });
+        assert!(support > carry);
+    }
+
+    #[test]
+    fn a_deathless_game_does_not_divide_by_zero() {
+        assert!(game_score(&scored(7, 0, 3, true)).is_finite());
+    }
+
+    #[test]
+    fn no_score_is_reported_below_the_sample_floor() {
+        let few: Vec<ScoredGame> = (0..SCORE_MIN_GAMES - 1)
+            .map(|_| scored(5, 2, 5, true))
+            .collect();
+        let (score, games) = player_score(&few);
+        assert_eq!(score, None);
+        assert_eq!(games, SCORE_MIN_GAMES - 1);
+        assert_eq!(player_score(&[]), (None, 0));
+    }
+
+    #[test]
+    fn unusable_games_do_not_count_toward_the_floor() {
+        let mut games: Vec<ScoredGame> = (0..5).map(|_| scored(5, 2, 5, true)).collect();
+        games.push(ScoredGame {
+            duration: 60,
+            ..scored(0, 0, 0, false)
+        });
+        let (score, counted) = player_score(&games);
+        assert_eq!(counted, 5);
+        assert!(close(
+            score.unwrap(),
+            game_score(&scored(5, 2, 5, true)),
+            1e-9
+        ));
     }
 }

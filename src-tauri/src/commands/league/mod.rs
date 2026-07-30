@@ -1,4 +1,9 @@
 pub mod analysis;
+pub mod champ_select;
+pub mod live;
+pub mod lobby;
+pub mod locator;
+pub mod meta;
 pub mod stats;
 pub mod ws;
 
@@ -26,66 +31,20 @@ pub struct LeagueStatus {
 static CACHED_CLIENT: Lazy<Mutex<Option<LcuClient>>> = Lazy::new(|| Mutex::new(None));
 static AUTO_ACCEPT: AtomicBool = AtomicBool::new(false);
 static CS_HANDLED: Lazy<Mutex<HashSet<i64>>> = Lazy::new(|| Mutex::new(HashSet::new()));
-
-fn extract_arg(cmdline: &str, key: &str) -> Option<String> {
-    let needle = format!("--{}=", key);
-    let start = cmdline.find(&needle)? + needle.len();
-    let rest = &cmdline[start..];
-    let value: String = rest
-        .chars()
-        .take_while(|c| !c.is_whitespace() && *c != '"' && *c != '\'')
-        .collect();
-    if value.is_empty() {
-        None
-    } else {
-        Some(value)
-    }
-}
-
-async fn read_process_command_lines() -> Result<String, String> {
-    #[cfg(windows)]
-    {
-        let output = crate::core::process::command("powershell")
-            .args([
-                "-NoProfile",
-                "-Command",
-                "Get-CimInstance Win32_Process -Filter \"Name='LeagueClientUx.exe'\" | Select-Object -ExpandProperty CommandLine",
-            ])
-            .output()
-            .await
-            .map_err(|e| format!("failed to query processes: {}", e))?;
-        Ok(String::from_utf8_lossy(&output.stdout).to_string())
-    }
-    #[cfg(not(windows))]
-    {
-        let output = tokio::process::Command::new("ps")
-            .args(["-axo", "command"])
-            .output()
-            .await
-            .map_err(|e| format!("failed to query processes: {}", e))?;
-        Ok(String::from_utf8_lossy(&output.stdout).to_string())
-    }
-}
+static CS_FIRST_SEEN: Lazy<Mutex<std::collections::HashMap<i64, std::time::Instant>>> =
+    Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
+static CS_DECLARED: Lazy<Mutex<HashSet<i64>>> = Lazy::new(|| Mutex::new(HashSet::new()));
 
 async fn discover_client() -> Option<LcuClient> {
-    let listing = read_process_command_lines().await.ok()?;
-    for line in listing.lines() {
-        if !line.contains("LeagueClientUx") {
-            continue;
-        }
-        let port = extract_arg(line, "app-port").and_then(|p| p.parse::<u16>().ok());
-        let token = extract_arg(line, "remoting-auth-token");
-        if let (Some(port), Some(token)) = (port, token) {
-            let region =
-                extract_arg(line, "region").or_else(|| extract_arg(line, "rso_platform_id"));
-            return Some(LcuClient {
-                port,
-                token,
-                region,
-            });
-        }
+    let (credentials, source) = locator::discover().await?;
+    if matches!(source, locator::Source::Lockfile) {
+        tracing::debug!("[league] credentials read from lockfile");
     }
-    None
+    Some(LcuClient {
+        port: credentials.port,
+        token: credentials.token,
+        region: credentials.region,
+    })
 }
 
 async fn get_client() -> Result<LcuClient, String> {
@@ -340,6 +299,17 @@ pub async fn league_get(path: String) -> Result<Value, String> {
     lcu_get_raw(&client, &path).await
 }
 
+/// Restarts only the client's interface process. The classic fix for a client
+/// stuck spinning or with a broken window size, and it keeps the queue spot —
+/// which is why it is worth offering instead of asking the user to close the game.
+#[tauri::command]
+pub async fn league_restart_ux() -> Result<(), String> {
+    ensure_enabled()?;
+    let client = get_client().await?;
+    lcu_post_raw(&client, "/riotclient/kill-and-restart-ux").await?;
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn league_summoner() -> Result<Value, String> {
     ensure_enabled()?;
@@ -523,6 +493,33 @@ pub async fn league_reroll() -> Result<(), String> {
     Ok(())
 }
 
+/// Spends the reroll to widen the bench but keeps the champion the user already
+/// had: the roll is read before it happens, then swapped back from the bench.
+#[tauri::command]
+pub async fn league_reroll_keeping_champion() -> Result<Value, String> {
+    ensure_enabled()?;
+    let client = get_client().await?;
+    let before = lcu_get_raw(&client, "/lol-champ-select/v1/current-champion")
+        .await
+        .ok()
+        .and_then(|v| v.as_i64());
+    lcu_post_raw(&client, "/lol-champ-select/v1/session/my-selection/reroll").await?;
+    let Some(champion_id) = before.filter(|id| *id > 0) else {
+        // Without knowing the previous champion there is nothing to restore, and
+        // the reroll itself already went through.
+        return Ok(json!({ "restored": false, "championId": Value::Null }));
+    };
+    let swapped = lcu_post_raw(
+        &client,
+        &format!("/lol-champ-select/v1/session/bench/swap/{}", champion_id),
+    )
+    .await;
+    Ok(json!({
+        "restored": swapped.is_ok(),
+        "championId": champion_id,
+    }))
+}
+
 #[tauri::command]
 pub async fn league_live_game() -> Result<Value, String> {
     ensure_enabled()?;
@@ -568,7 +565,19 @@ fn player_identity(entry: &Value, is_ally: bool) -> Value {
         "championId": entry.get("championId").and_then(Value::as_i64).unwrap_or(0),
         "cellId": entry.get("cellId").and_then(Value::as_i64),
         "isAlly": is_ally,
+        "partyId": party_id(entry),
     })
+}
+
+/// The gameflow session tags every player with the party it queued in, which is
+/// the server's own grouping — far better than guessing from shared history.
+/// Champ select does not carry it, so it stays null there.
+fn party_id(entry: &Value) -> Value {
+    match entry.get("teamParticipantId") {
+        Some(Value::String(s)) if !s.is_empty() => json!(s),
+        Some(Value::Number(n)) => json!(n.to_string()),
+        _ => Value::Null,
+    }
 }
 
 #[tauri::command]
@@ -714,6 +723,7 @@ fn compute_history_stats(games: &[Value], puuid: &str) -> Value {
     let mut flash_on_f = 0usize;
     let mut total_damage = 0.0f64;
     let mut total_gold = 0.0f64;
+    let mut scored_games: Vec<stats::ScoredGame> = Vec::new();
 
     for game in games {
         let participant = game
@@ -751,9 +761,29 @@ fn compute_history_stats(games: &[Value], puuid: &str) -> Value {
         if win {
             wins += 1;
         }
-        kills += stats.get("kills").and_then(Value::as_i64).unwrap_or(0);
-        deaths += stats.get("deaths").and_then(Value::as_i64).unwrap_or(0);
-        assists += stats.get("assists").and_then(Value::as_i64).unwrap_or(0);
+        let game_kills = stats.get("kills").and_then(Value::as_i64).unwrap_or(0);
+        let game_deaths = stats.get("deaths").and_then(Value::as_i64).unwrap_or(0);
+        let game_assists = stats.get("assists").and_then(Value::as_i64).unwrap_or(0);
+        kills += game_kills;
+        deaths += game_deaths;
+        assists += game_assists;
+        scored_games.push(stats::ScoredGame {
+            queue_id: game.get("queueId").and_then(Value::as_i64).unwrap_or(-1),
+            duration: game
+                .get("gameDuration")
+                .and_then(Value::as_i64)
+                .unwrap_or(0),
+            kills: game_kills,
+            deaths: game_deaths,
+            assists: game_assists,
+            win,
+            support: participant
+                .get("timeline")
+                .and_then(|t| t.get("lane"))
+                .and_then(Value::as_str)
+                == Some("NONE")
+                || stats.get("role").and_then(Value::as_str) == Some("DUO_SUPPORT"),
+        });
         total_damage += stats
             .get("totalDamageDealtToChampions")
             .and_then(Value::as_f64)
@@ -856,11 +886,15 @@ fn compute_history_stats(games: &[Value], puuid: &str) -> Value {
         Value::Null
     };
 
+    let (score, scored_count) = stats::player_score(&scored_games);
+
     json!({
         "games": total,
         "wins": wins,
         "winrate": winrate,
         "kda": (kda * 10.0).round() / 10.0,
+        "score": score.map(|s| (s * 100.0).round() / 100.0),
+        "scoredGames": scored_count,
         "streak": { "win": streak_kind.unwrap_or(false), "length": streak_len },
         "topChampions": top.iter().map(|(id, g, w)| json!({ "championId": id, "games": g, "wins": w })).collect::<Vec<_>>(),
         "insights": insights,
@@ -1196,18 +1230,29 @@ pub async fn league_match_analysis() -> Result<Value, String> {
 
     let win = stats::team_win_probability(&ally_strengths, &enemy_strengths);
 
-    // Two players who keep appearing in the same games are queueing together.
-    let mut pairs: Vec<(usize, usize, u32)> = Vec::new();
-    for i in 0..players.len() {
-        for j in (i + 1)..players.len() {
-            let a: HashSet<i64> = histories[i].iter().copied().collect();
-            let shared = histories[j].iter().filter(|id| a.contains(id)).count() as u32;
-            if shared > 0 {
-                pairs.push((i, j, shared));
+    let party_ids: Vec<Option<String>> = players
+        .iter()
+        .map(|p| p.get("partyId").and_then(Value::as_str).map(str::to_string))
+        .collect();
+    let official = stats::party_groups(&party_ids);
+    let from_party = !official.is_empty();
+    let groups = if from_party {
+        official
+    } else {
+        // Fallback for champ select, where the party id is absent: two players
+        // who keep appearing in the same games are queueing together.
+        let mut pairs: Vec<(usize, usize, u32)> = Vec::new();
+        for i in 0..players.len() {
+            for j in (i + 1)..players.len() {
+                let a: HashSet<i64> = histories[i].iter().copied().collect();
+                let shared = histories[j].iter().filter(|id| a.contains(id)).count() as u32;
+                if shared > 0 {
+                    pairs.push((i, j, shared));
+                }
             }
         }
-    }
-    let groups = stats::premade_groups(players.len(), &pairs, 3);
+        stats::premade_groups(players.len(), &pairs, 3)
+    };
     let premades: Vec<Value> = groups
         .iter()
         .enumerate()
@@ -1231,6 +1276,271 @@ pub async fn league_match_analysis() -> Result<Value, String> {
         "totalPlayers": win.total_players,
         "players": detail,
         "premades": premades,
+        "premadeSource": if from_party { "party" } else { "history" },
+    }))
+}
+
+/// Build reference for a champion in a position: skill order, items by phase,
+/// summoner spells and counters, from the same public op.gg API the tier list
+/// uses. Presented as reference, never applied automatically.
+#[tauri::command]
+pub async fn league_champion_meta(
+    champion_id: i64,
+    position: Option<String>,
+    region: Option<String>,
+    tier: Option<String>,
+) -> Result<Value, String> {
+    ensure_enabled()?;
+    let position = position.unwrap_or_else(|| "mid".to_string()).to_lowercase();
+    let region = region.unwrap_or_else(|| "br".to_string());
+    let bracket = tier.unwrap_or_else(|| "emerald_plus".to_string());
+    if champion_id <= 0
+        || !position.chars().all(|c| c.is_ascii_alphabetic())
+        || !region.chars().all(|c| c.is_ascii_alphanumeric())
+        || !bracket
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        return Err("invalid champion, position, region or tier".to_string());
+    }
+    let url = format!(
+        "https://lol-api-champion.op.gg/api/{}/champions/ranked/{}/{}?tier={}",
+        region, champion_id, position, bracket
+    );
+    let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(20))
+        .user_agent("OmniGet")
+        .build()
+        .map_err(|e| e.to_string())?;
+    let resp = http
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("build reference unavailable: {}", e))?;
+    if !resp.status().is_success() {
+        return Err(format!(
+            "build reference returned {}",
+            resp.status().as_u16()
+        ));
+    }
+    let body = resp
+        .json::<Value>()
+        .await
+        .map_err(|e| format!("invalid build reference response: {}", e))?;
+    let data = body.get("data").unwrap_or(&body);
+
+    let array = |key: &str| -> Vec<Value> {
+        data.get(key)
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+    };
+    let phase = |key: &str| -> Value {
+        let entries = array(key);
+        let picked = meta::most_played(&entries);
+        json!({
+            "ids": meta::id_list(picked),
+            "winrate": meta::variant_winrate(picked),
+        })
+    };
+
+    let skills = array("skills");
+    let order = meta::skill_order(&skills);
+
+    Ok(json!({
+        "championId": champion_id,
+        "position": position,
+        "source": "op.gg",
+        "skillOrder": order,
+        "skillPriority": meta::first_levels(&order, 3),
+        "starterItems": phase("starter_items"),
+        "coreItems": phase("core_items"),
+        "boots": phase("boots"),
+        "lastItems": phase("last_items"),
+        "spells": phase("summoner_spells"),
+        "counters": meta::counters(data),
+    }))
+}
+
+/// Sets the summoner icon. Any owned icon id works; the client rejects ids the
+/// account does not own, and that error is surfaced as-is.
+#[tauri::command]
+pub async fn league_set_icon(icon_id: i64) -> Result<Value, String> {
+    ensure_enabled()?;
+    if icon_id < 0 {
+        return Err("invalid icon".to_string());
+    }
+    let client = get_client().await?;
+    lcu_send(
+        &client,
+        reqwest::Method::PUT,
+        "/lol-summoner/v1/current-summoner/icon",
+        Some(json!({ "profileIconId": icon_id })),
+    )
+    .await
+}
+
+/// Sets the splash art behind the profile, chosen from a skin the account owns.
+#[tauri::command]
+pub async fn league_set_profile_background(skin_id: i64) -> Result<Value, String> {
+    ensure_enabled()?;
+    if skin_id <= 0 {
+        return Err("invalid skin".to_string());
+    }
+    let client = get_client().await?;
+    lcu_send(
+        &client,
+        reqwest::Method::POST,
+        "/lol-summoner/v1/current-summoner/summoner-profile",
+        Some(json!({ "key": "backgroundSkinId", "value": skin_id })),
+    )
+    .await
+}
+
+/// Chat availability and status message. Only the fields the user changed are
+/// touched: the payload is read first and patched, because a full replacement
+/// wipes the presence data the client keeps there.
+#[tauri::command]
+pub async fn league_set_status(
+    availability: Option<String>,
+    message: Option<String>,
+) -> Result<Value, String> {
+    ensure_enabled()?;
+    if let Some(availability) = availability.as_deref() {
+        if !matches!(availability, "chat" | "away" | "dnd" | "offline" | "mobile") {
+            return Err("invalid availability".to_string());
+        }
+    }
+    if message.as_deref().map(str::len).unwrap_or(0) > 140 {
+        return Err("status message too long".to_string());
+    }
+    let client = get_client().await?;
+    let mut me = lcu_get_raw(&client, "/lol-chat/v1/me").await?;
+    if let Some(availability) = availability {
+        me["availability"] = json!(availability);
+    }
+    if let Some(message) = message {
+        me["statusMessage"] = json!(message);
+    }
+    lcu_send(&client, reqwest::Method::PUT, "/lol-chat/v1/me", Some(me)).await
+}
+
+/// Skins the account owns for a champion, so the background picker offers only
+/// what can actually be set.
+#[tauri::command]
+pub async fn league_owned_skins(champion_id: i64) -> Result<Value, String> {
+    ensure_enabled()?;
+    if champion_id <= 0 {
+        return Err("invalid champion".to_string());
+    }
+    let client = get_client().await?;
+    let champion = lcu_get_raw(
+        &client,
+        &format!("/lol-champions/v1/inventories/{}/champions", champion_id),
+    )
+    .await
+    .unwrap_or(Value::Null);
+    let skins: Vec<Value> = champion
+        .get("skins")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter(|s| {
+                    s.get("ownership")
+                        .and_then(|o| o.get("owned"))
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false)
+                })
+                .filter_map(|s| {
+                    Some(json!({
+                        "id": s.get("id").and_then(Value::as_i64)?,
+                        "name": s.get("name").and_then(Value::as_str).unwrap_or(""),
+                    }))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(json!({ "skins": skins }))
+}
+
+/// Role preferences for the next queue. The client takes both slots at once, and
+/// the second may be empty ("FILL" is expressed as an unset second choice).
+#[tauri::command]
+pub async fn league_set_positions(first: String, second: Option<String>) -> Result<Value, String> {
+    ensure_enabled()?;
+    const ROLES: [&str; 6] = ["TOP", "JUNGLE", "MIDDLE", "BOTTOM", "UTILITY", "FILL"];
+    let second = second.unwrap_or_else(|| "FILL".to_string());
+    if !ROLES.contains(&first.as_str()) || !ROLES.contains(&second.as_str()) {
+        return Err("invalid position".to_string());
+    }
+    let client = get_client().await?;
+    lcu_send(
+        &client,
+        reqwest::Method::PUT,
+        "/lol-lobby/v2/lobby/members/localMember/position-preferences",
+        Some(json!({ "firstPreference": first, "secondPreference": second })),
+    )
+    .await
+}
+
+/// End-of-game summary the client shows on its own screen, useful when that
+/// screen was dismissed too fast.
+#[tauri::command]
+pub async fn league_end_of_game_stats() -> Result<Value, String> {
+    ensure_enabled()?;
+    let client = get_client().await?;
+    lcu_get_raw(&client, "/lol-end-of-game/v1/eog-stats-block").await
+}
+
+/// Where the game is installed, as far as the running process reveals. Null when
+/// the client is not running or the path could not be told.
+#[tauri::command]
+pub async fn league_install_dir() -> Result<Value, String> {
+    ensure_enabled()?;
+    let dir = locator::install_dir().await;
+    Ok(json!({ "path": dir.map(|p| p.to_string_lossy().to_string()) }))
+}
+
+/// Objective respawn estimates and a readable feed of what just happened,
+/// derived from the in-game event log.
+#[tauri::command]
+pub async fn league_live_events() -> Result<Value, String> {
+    ensure_enabled()?;
+    let http = http_client()?;
+    let base = "https://127.0.0.1:2999/liveclientdata";
+    let raw = http
+        .get(format!("{}/eventdata", base))
+        .send()
+        .await
+        .map_err(|e| format!("live client not reachable: {}", e))?
+        .json::<Value>()
+        .await
+        .map_err(|e| format!("invalid live client response: {}", e))?;
+    let game_time = http
+        .get(format!("{}/gamestats", base))
+        .send()
+        .await
+        .ok()
+        .and_then(|r| r.error_for_status().ok());
+    let game_time = match game_time {
+        Some(response) => response
+            .json::<Value>()
+            .await
+            .ok()
+            .and_then(|v| v.get("gameTime").and_then(Value::as_f64))
+            .unwrap_or(0.0),
+        None => 0.0,
+    };
+    let events: Vec<Value> = raw
+        .get("Events")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    Ok(json!({
+        "gameTime": game_time,
+        "objectives": live::objective_timers(&events, game_time),
+        "events": live::game_events(&events, 12),
     }))
 }
 
@@ -2065,6 +2375,18 @@ pub async fn league_apply_runes(
         .await;
     }
 
+    // Creating a page into a full book fails with an opaque error, so the
+    // inventory is checked first and the reason is said out loud.
+    if let Ok(inventory) = lcu_get_raw(&client, "/lol-perks/v1/inventory").await {
+        let can_add = inventory
+            .get("canAddCustomPage")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        if !can_add {
+            return Err("rune pages are full".to_string());
+        }
+    }
+
     let page = lcu_send(
         &client,
         reqwest::Method::POST,
@@ -2822,6 +3144,8 @@ async fn handle_champ_select(
         }
     }
 
+    let ally_intents = champ_select::ally_pick_intents(session, cell);
+
     let mut pickable: Option<HashSet<i64>> = None;
     let mut bannable: Option<HashSet<i64>> = None;
 
@@ -2890,21 +3214,52 @@ async fn handle_champ_select(
                 Some(p) => p,
                 None => continue,
             };
-            let choice = list
-                .iter()
-                .find(|c| pool.contains(c) && !taken.contains(c))
-                .copied();
-            let choice = match choice {
+            let avoid: HashSet<i64> = if action_type == "ban" {
+                ally_intents.clone()
+            } else {
+                HashSet::new()
+            };
+            let choice = match champ_select::choose_champion(&list, pool, &taken, &avoid) {
                 Some(c) => c,
                 None => continue,
             };
-            let complete_action = settings.auto_lock || action_type == "ban";
+            if action_type == "ban" {
+                let delay = champ_select::ban_delay_seconds(settings.auto_ban_delay);
+                let elapsed = {
+                    let mut seen = CS_FIRST_SEEN.lock().await;
+                    let first = seen
+                        .entry(action_id)
+                        .or_insert_with(std::time::Instant::now);
+                    first.elapsed().as_secs_f64()
+                };
+                if !champ_select::delay_elapsed(elapsed, delay) {
+                    continue;
+                }
+            }
+            // A ban that is declared but never confirmed accomplishes nothing, so
+            // the confirm modes only apply to picks.
+            let complete_action = if action_type == "ban" {
+                true
+            } else {
+                let mode =
+                    champ_select::pick_confirm(settings.auto_lock, settings.auto_lock_at_timeout);
+                let lock = champ_select::should_lock_now(mode, champ_select::time_left_ms(session));
+                if !lock && CS_DECLARED.lock().await.contains(&action_id) {
+                    // Intent is already showing; nothing to send until it is time
+                    // to lock (or never, when the user does the locking).
+                    continue;
+                }
+                lock
+            };
             let path = format!("/lol-champ-select/v1/session/actions/{}", action_id);
             let body = json!({ "championId": choice, "completed": complete_action });
             match lcu_send(client, reqwest::Method::PATCH, &path, Some(body)).await {
                 Ok(_) => {
-                    let mut handled = CS_HANDLED.lock().await;
-                    handled.insert(action_id);
+                    if complete_action {
+                        CS_HANDLED.lock().await.insert(action_id);
+                    } else {
+                        CS_DECLARED.lock().await.insert(action_id);
+                    }
                     tracing::info!(
                         "[league] auto-{} champion {} (locked: {})",
                         action_type,

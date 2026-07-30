@@ -2,6 +2,9 @@
   import { invoke } from "@tauri-apps/api/core";
   import { t } from "$lib/i18n";
   import { CDRAGON, TAG_KEYS, type Champion, type RankedEntry, type ScoutPlayer } from "./shared";
+  import { markedPlayers, winrateSquad } from "$lib/league-scouting";
+  import { availability, featureById, type Platform } from "./registry";
+  import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 
   let {
     analysis,
@@ -16,6 +19,8 @@
     notes,
     onSaveNote,
     timesSeenBefore,
+    platform,
+    clientConnected,
   }: {
     analysis: any;
     analysisLoading: boolean;
@@ -29,7 +34,36 @@
     notes: Record<string, string>;
     onSaveNote: (puuid: string, text: string) => void;
     timesSeenBefore: (puuid: string) => number;
+    platform?: Platform;
+    clientConnected?: boolean;
   } = $props();
+
+  let analysisFeature = featureById("analysis");
+  let analysisAvailability = $derived.by(() => {
+    if (!analysisFeature) return { available: true as const };
+    return availability(analysisFeature, {
+      platform: platform ?? "macos",
+      clientConnected: clientConnected ?? true,
+      inGame: phase === "ChampSelect" || phase === "InProgress",
+    });
+  });
+
+  let marked = $derived(markedPlayers(scoutPlayers, notes));
+  let squadSide = $derived(winrateSquad(scoutPlayers, analysis?.premades ?? [], scoutReports));
+
+  let copied = $state("");
+
+  async function copyRiotId(player: { gameName?: string; tagLine?: string; puuid?: string }) {
+    const id = player.tagLine ? `${player.gameName}#${player.tagLine}` : (player.gameName ?? "");
+    if (!id) return;
+    try {
+      await writeText(id);
+      copied = player.puuid ?? id;
+      setTimeout(() => { if (copied === (player.puuid ?? id)) copied = ""; }, 1500);
+    } catch {
+      copied = "";
+    }
+  }
 
   let openNotes = $state<Record<string, boolean>>({});
   let chatPreview = $state("");
@@ -115,12 +149,17 @@
         {#each analysis.premades as group (group.label)}
           <span class="scout-tag">{group.label}: {group.puuids.length} {$t("league.players")}</span>
         {/each}
+        <span class="premade-source">
+          {analysis.premadeSource === "party"
+            ? $t("league.premade_source_party")
+            : $t("league.premade_source_history")}
+        </span>
       </div>
     {/if}
   </section>
 {:else}
   <div class="guard-card">
-    <p>{$t("league.win_unavailable")}</p>
+    <p>{analysisAvailability.available ? $t("league.win_unavailable") : $t(analysisAvailability.reasonKey)}</p>
     <button class="button" onclick={onRefreshAnalysis} disabled={analysisLoading}>{$t("league.refresh")}</button>
   </div>
 {/if}
@@ -132,6 +171,25 @@
       <button class="button" onclick={onRefreshScouting} disabled={scoutLoading}>{$t("league.refresh")}</button>
     </div>
     <div class="scout-teams">
+      {#if marked.ally.length > 0 || marked.enemy.length > 0 || squadSide}
+        <div class="scout-notices">
+          {#if marked.ally.length > 0}
+            <p class="scout-notice">
+              {$t("league.marked_in_allies")} <strong>{marked.ally.join(", ")}</strong>
+            </p>
+          {/if}
+          {#if marked.enemy.length > 0}
+            <p class="scout-notice">
+              {$t("league.marked_in_enemies")} <strong>{marked.enemy.join(", ")}</strong>
+            </p>
+          {/if}
+          {#if squadSide}
+            <p class="scout-notice">
+              {squadSide === "enemy" ? $t("league.squad_enemy") : $t("league.squad_ally")}
+            </p>
+          {/if}
+        </div>
+      {/if}
       {#each scoutGroups() as group (group.label)}
         <div class="scout-team">
           <h4 class="scout-team-title" class:enemy={!group.ally}>{group.label}</h4>
@@ -162,6 +220,11 @@
                       <span class="scout-kda">
                         {r.stats.kda} KDA{#if r.impact !== null && r.impact !== undefined} · <span class="impact" title={$t("league.impact_hint") as string}>{r.impact}</span>{/if}
                       </span>
+                      {#if r.stats.score !== null && r.stats.score !== undefined}
+                        <span class="scout-score" title={`${$t("league.score_hint")} (${r.stats.scoredGames})`}>
+                          {$t("league.score_label")} {r.stats.score.toFixed(1)}
+                        </span>
+                      {/if}
                     </div>
                   {:else if r?.privateProfile}
                     <span class="scout-private">{$t("league.scout_private")}</span>
@@ -169,6 +232,11 @@
                     <span class="scout-private">{$t("league.scout_no_history")}</span>
                   {:else if r}
                     <span class="scout-private">…</span>
+                  {/if}
+                  {#if p.gameName}
+                    <button class="note-toggle" onclick={() => copyRiotId(p)} aria-label={$t("league.copy_riot_id") as string} title={$t("league.copy_riot_id") as string}>
+                      {copied === (p.puuid ?? p.gameName) ? "✓" : "⧉"}
+                    </button>
                   {/if}
                   {#if p.puuid}
                     <button class="note-toggle" class:has-note={(notes[p.puuid] ?? "").trim() !== ""} onclick={() => { openNotes = { ...openNotes, [p.puuid]: !openNotes[p.puuid] }; }} aria-label={$t("league.scout_note_placeholder") as string} aria-expanded={openNotes[p.puuid] ?? false}>✎</button>
